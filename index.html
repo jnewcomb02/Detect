@@ -12,19 +12,30 @@
   #stage { position: relative; width: 100%; height: 100%; overflow: hidden; }
   video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
   #hud { position: absolute; left: 0; right: 0; bottom: 0; padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
-    background: linear-gradient(transparent, rgba(0,0,0,.75)); display: flex; flex-direction: column; gap: 8px; }
+    background: linear-gradient(transparent, rgba(0,0,0,.8) 25%); display: flex; flex-direction: column; gap: 8px; }
   #row { display: flex; gap: 8px; align-items: center; }
   button { flex: 1; padding: 12px; font-size: 16px; border: 0; border-radius: 10px;
     background: #2b7de9; color: #fff; }
   button.secondary { background: #444; flex: 0 0 auto; }
+  button.accent { background: #e8791a; }
   button:disabled { opacity: .5; }
-  .pickInput { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; font-size: 100px; cursor: pointer; }
-  .pick { position: relative; overflow: hidden; display: none; padding: 14px; text-align: center; font-size: 16px; font-weight: 600;
-    border-radius: 10px; background: #e8a317; color: #000; cursor: pointer; }
-  label { font-size: 13px; display: flex; gap: 8px; align-items: center; }
+  label.slider { font-size: 13px; display: flex; gap: 8px; align-items: center; }
   input[type=range] { flex: 1; }
+  .pick { position: relative; overflow: hidden; display: none; padding: 14px; text-align: center; font-size: 16px;
+    font-weight: 600; border-radius: 10px; background: #e8a317; color: #000; cursor: pointer; }
+  .pickInput { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; font-size: 100px; cursor: pointer; }
   #status { position: absolute; top: calc(8px + env(safe-area-inset-top)); left: 8px; right: 8px;
     font-size: 13px; text-shadow: 0 0 4px #000; pointer-events: none; }
+  #teach { display: none; flex-direction: column; gap: 8px; max-height: 40vh; overflow-y: auto;
+    background: rgba(30,30,30,.9); border-radius: 12px; padding: 12px; }
+  #teach input[type=text] { width: 100%; padding: 10px; font-size: 16px; border-radius: 8px;
+    border: 1px solid #666; background: #111; color: #fff; }
+  #teachMsg { font-size: 13px; color: #ffcc80; min-height: 1.2em; }
+  #hint { font-size: 12px; color: #bbb; }
+  #objects { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { background: #333; border-radius: 16px; padding: 6px 6px 6px 12px; font-size: 14px;
+    display: inline-flex; gap: 8px; align-items: center; }
+  .chip button { flex: none; padding: 2px 9px; font-size: 14px; background: #666; border-radius: 12px; }
 </style>
 </head>
 <body>
@@ -33,94 +44,255 @@
   <canvas id="overlay"></canvas>
   <div id="status">Tap Start to begin.</div>
   <div id="hud">
-    <label id="pickBtn" class="pick">Choose model file (.tflite)
+    <label id="pickBtn" class="pick"><span id="pickText">Choose model file (.tflite)</span>
       <input id="modelFile" type="file" class="pickInput">
     </label>
-    <label>Min confidence <input id="conf" type="range" min="20" max="90" value="50"><span id="confVal">50%</span></label>
+
+    <div id="teach">
+      <div id="hint">Aim the dashed square at ONE object, type its name, then tap Capture. Capture again from other angles and backgrounds for better accuracy.</div>
+      <input id="nameInput" type="text" placeholder="Object name (e.g. my mug)" autocomplete="off">
+      <div id="row">
+        <button id="captureBtn" class="accent">Capture ×5</button>
+        <button id="clearBtn" class="secondary">Clear all</button>
+      </div>
+      <label class="slider">Square size <input id="size" type="range" min="20" max="80" value="45"><span id="sizeVal">45%</span></label>
+      <label class="slider">Match strictness <input id="thr" type="range" min="50" max="95" value="75"><span id="thrVal">75%</span></label>
+      <div id="teachMsg"></div>
+      <div id="objects"></div>
+    </div>
+
+    <label class="slider">Min confidence <input id="conf" type="range" min="20" max="90" value="50"><span id="confVal">50%</span></label>
     <div id="row">
       <button id="start">Start</button>
-      <button id="flip" class="secondary" disabled>Flip camera</button>
+      <button id="teachBtn" class="secondary">Teach</button>
+      <button id="flip" class="secondary" disabled>Flip</button>
     </div>
   </div>
 </div>
 
 <script type="module">
-import { ObjectDetector, FilesetResolver }
+import { ObjectDetector, ImageEmbedder, FilesetResolver }
   from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 
 const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
-const MODEL = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite";
+const DETECT_URLS = ["./efficientdet_lite0.tflite",
+  "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite"];
+const EMBED_URLS = ["./mobilenet_v3_small.tflite",
+  "https://storage.googleapis.com/mediapipe-models/image_embedder/mobilenet_v3_small/float32/1/mobilenet_v3_small.tflite"];
+const STORE_KEY = "customObjects.v1";
 
-const video = document.getElementById("video");
-const canvas = document.getElementById("overlay");
-const ctx = canvas.getContext("2d");
-const statusEl = document.getElementById("status");
-const startBtn = document.getElementById("start");
-const flipBtn = document.getElementById("flip");
-const conf = document.getElementById("conf");
-const confVal = document.getElementById("confVal");
+const $ = (id) => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+const statusEl = $("status"), startBtn = $("start"), flipBtn = $("flip"), teachBtn = $("teachBtn");
+const conf = $("conf"), confVal = $("confVal");
+const sizeSl = $("size"), sizeVal = $("sizeVal"), thrSl = $("thr"), thrVal = $("thrVal");
+const teachPanel = $("teach"), teachMsgEl = $("teachMsg"), nameInput = $("nameInput");
+const captureBtn = $("captureBtn"), clearBtn = $("clearBtn"), objectsEl = $("objects");
+const pickBtn = $("pickBtn"), pickText = $("pickText"), pickInput = $("modelFile");
 
-let detector = null;
-let stream = null;
-let facing = "environment";
-let running = false;
-let lastVideoTime = -1;
-let frames = 0, fpsStart = performance.now(), fps = 0;
+let fileset = null, detector = null, embedder = null, embedderLoading = null;
+let stream = null, facing = "environment", running = false, lastVideoTime = -1;
+let frames = 0, fpsStart = performance.now();
+let panelOpen = false;
+let samples = loadSamples();       // [{name, emb: Float32Array}]
+let custom = [];                    // latest recognition results
+let lastRecog = 0;
 
-conf.addEventListener("input", () => {
-  confVal.textContent = conf.value + "%";
-  if (detector) detector.setOptions({ scoreThreshold: conf.value / 100 });
-});
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const teachMsg = (t) => { teachMsgEl.textContent = t; };
 
-async function probe(url, what) {
-  let r;
-  try { r = await fetch(url); }
-  catch (e) { throw new Error(`Could not download ${what} (${new URL(url).host}). Check internet, VPN/ad-blocker, or private DNS.`); }
-  if (!r.ok) throw new Error(`${what} download returned HTTP ${r.status}`);
-  return r;
+/* ---------------- storage ---------------- */
+function loadSamples() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STORE_KEY) || "[]");
+    return raw.map(s => ({ name: s.name, emb: Float32Array.from(s.emb) }));
+  } catch (e) { return []; }
+}
+function saveSamples() {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(
+      samples.map(s => ({ name: s.name, emb: Array.from(s.emb, x => +x.toFixed(4)) }))));
+  } catch (e) { teachMsg("Couldn't save to this browser's storage (full or blocked)."); }
 }
 
-// Tries a copy next to this page first, then Google's host, then asks you to pick the file.
-async function loadModelBytes() {
-  for (const url of ["./efficientdet_lite0.tflite", MODEL]) {
+/* ---------------- model loading ---------------- */
+async function loadModelBytes(label, urls, interactive) {
+  for (const url of urls) {
     try {
       const r = await fetch(url);
       if (!r.ok) continue;
       const bytes = new Uint8Array(await r.arrayBuffer());
-      if (bytes.length > 100000) return bytes; // ignore HTML error pages
+      if (bytes.length > 100000) return bytes;   // ignore HTML error pages
     } catch (e) { console.warn("Model fetch failed:", url, e); }
   }
-  statusEl.textContent = "Couldn't download the model. Tap 'Choose file' and pick efficientdet_lite0.tflite.";
-  const input = document.getElementById("modelFile");
-  const pickBtn = document.getElementById("pickBtn");
+  if (!interactive) return null;
+  const fname = urls[0].replace("./", "");
+  statusEl.textContent = `Couldn't download the ${label} model. Tap the orange button and pick ${fname}.`;
+  pickText.textContent = `Choose ${fname}`;
   pickBtn.style.display = "block";
   return await new Promise((resolve) => {
-    input.onchange = async () => {
-      if (!input.files[0]) return;
+    pickInput.onchange = async () => {
+      if (!pickInput.files[0]) return;
       pickBtn.style.display = "none";
       statusEl.textContent = "Loading model…";
-      resolve(new Uint8Array(await input.files[0].arrayBuffer()));
+      resolve(new Uint8Array(await pickInput.files[0].arrayBuffer()));
     };
   });
 }
 
-async function createDetector() {
-  statusEl.textContent = "Checking MediaPipe files…";
-  await probe(`${WASM}/vision_wasm_internal.js`, "MediaPipe runtime");
-  statusEl.textContent = "Loading model…";
-  const modelBytes = await loadModelBytes();
+async function getFileset() {
+  if (!fileset) {
+    let r;
+    try { r = await fetch(`${WASM}/vision_wasm_internal.js`); }
+    catch (e) { throw new Error("Could not download the MediaPipe runtime (cdn.jsdelivr.net). Check internet, VPN or ad-blocker."); }
+    if (!r.ok) throw new Error(`MediaPipe runtime download returned HTTP ${r.status}`);
+    fileset = await FilesetResolver.forVisionTasks(WASM);
+  }
+  return fileset;
+}
 
-  const fileset = await FilesetResolver.forVisionTasks(WASM);
-  const make = (delegate) => ObjectDetector.createFromOptions(fileset, {
-    baseOptions: { modelAssetBuffer: modelBytes, delegate },
-    runningMode: "VIDEO",
-    scoreThreshold: conf.value / 100,
-    maxResults: 10,
-  });
+async function withDelegate(make) {
   try { return await make("GPU"); }
   catch (e) { console.warn("GPU delegate failed, using CPU", e); return await make("CPU"); }
 }
 
+async function createDetector() {
+  statusEl.textContent = "Loading model…";
+  const bytes = await loadModelBytes("detection", DETECT_URLS, true);
+  const fs = await getFileset();
+  return withDelegate((delegate) => ObjectDetector.createFromOptions(fs, {
+    baseOptions: { modelAssetBuffer: bytes, delegate },
+    runningMode: "VIDEO",
+    scoreThreshold: conf.value / 100,
+    maxResults: 10,
+  }));
+}
+
+function ensureEmbedder(interactive) {
+  if (embedder) return Promise.resolve(true);
+  if (embedderLoading) return embedderLoading;
+  embedderLoading = (async () => {
+    try {
+      const bytes = await loadModelBytes("learning", EMBED_URLS, interactive);
+      if (!bytes) return false;
+      const fs = await getFileset();
+      embedder = await withDelegate((delegate) => ImageEmbedder.createFromOptions(fs, {
+        baseOptions: { modelAssetBuffer: bytes, delegate },
+        runningMode: "IMAGE", l2Normalize: true, quantize: false,
+      }));
+      return true;
+    } catch (e) {
+      console.error(e);
+      teachMsg("Learning model failed: " + (e.message || e));
+      return false;
+    } finally { embedderLoading = null; }
+  })();
+  return embedderLoading;
+}
+
+/* ---------------- embeddings ---------------- */
+const crop = document.createElement("canvas");
+crop.width = crop.height = 224;
+const cctx = crop.getContext("2d");
+
+function squareAround(x, y, w, h) {
+  const s = Math.max(w, h), cx = x + w / 2, cy = y + h / 2;
+  return { x: cx - s / 2, y: cy - s / 2, w: s, h: s };
+}
+function reticleBox() {
+  const s = Math.min(video.videoWidth, video.videoHeight) * sizeSl.value / 100;
+  return { x: (video.videoWidth - s) / 2, y: (video.videoHeight - s) / 2, w: s, h: s };
+}
+function embedRegion(box) {
+  const x0 = Math.max(0, box.x), y0 = Math.max(0, box.y);
+  const x1 = Math.min(video.videoWidth, box.x + box.w), y1 = Math.min(video.videoHeight, box.y + box.h);
+  const w = x1 - x0, h = y1 - y0;
+  if (w < 16 || h < 16) return null;
+  cctx.drawImage(video, x0, y0, w, h, 0, 0, 224, 224);
+  const r = embedder.embed(crop);
+  return Float32Array.from(r.embeddings[0].floatEmbedding);
+}
+function dot(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
+
+function classify(vec) {
+  const best = {};
+  for (const s of samples) {
+    const sim = dot(vec, s.emb);
+    if (!(s.name in best) || sim > best[s.name]) best[s.name] = sim;
+  }
+  let name = null, score = -1;
+  for (const k in best) if (best[k] > score) { score = best[k]; name = k; }
+  return score >= thrSl.value / 100 ? { name, score } : null;
+}
+
+function iou(a, b) {
+  const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y);
+  const x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  return inter / (a.w * a.h + b.w * b.h - inter || 1);
+}
+
+function recognize(dets) {
+  if (!embedder || !samples.length) { custom = []; return; }
+  const now = performance.now();
+  if (now - lastRecog < 350) return;
+  lastRecog = now;
+  const out = [];
+  const cands = dets.slice(0, 3).map(d => {
+    const b = d.boundingBox;
+    return { box: squareAround(b.originX, b.originY, b.width, b.height),
+             bb: { x: b.originX, y: b.originY, w: b.width, h: b.height }, reticle: false };
+  });
+  cands.push({ box: reticleBox(), bb: null, reticle: true });
+  for (const c of cands) {
+    const v = embedRegion(c.box);
+    if (!v) continue;
+    const m = classify(v);
+    if (m) out.push({ name: m.name, score: m.score, bb: c.bb, reticle: c.reticle });
+  }
+  custom = out;
+}
+
+/* ---------------- drawing ---------------- */
+function drawBox(b, label, color, dashed) {
+  ctx.setLineDash(dashed ? [12, 8] : []);
+  ctx.strokeStyle = color;
+  ctx.strokeRect(b.x, b.y, b.w, b.h);
+  ctx.setLineDash([]);
+  if (!label) return;
+  const tw = ctx.measureText(label).width + 8;
+  const th = parseInt(ctx.font, 10) + 6;
+  const ty = Math.max(0, b.y - th);
+  ctx.fillStyle = color;
+  ctx.fillRect(b.x, ty, tw, th);
+  ctx.fillStyle = "#000";
+  ctx.fillText(label, b.x + 4, ty + 3);
+}
+
+function draw(result) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.lineWidth = Math.max(2, canvas.width / 320);
+  ctx.font = `${Math.max(14, canvas.width / 45)}px system-ui, sans-serif`;
+  ctx.textBaseline = "top";
+  const used = new Set();
+  for (const d of result.detections) {
+    const b = d.boundingBox, c = d.categories[0];
+    const bb = { x: b.originX, y: b.originY, w: b.width, h: b.height };
+    let label = `${c.categoryName} ${Math.round(c.score * 100)}%`, color = "#00e676";
+    let best = null, bi = 0.3;
+    for (const m of custom) if (m.bb) { const i = iou(bb, m.bb); if (i > bi) { bi = i; best = m; } }
+    if (best) { label = `${best.name} ${Math.round(best.score * 100)}%`; color = "#ff9800"; used.add(best.name); }
+    drawBox(bb, label, color, false);
+  }
+  if (panelOpen || samples.length) {
+    const r = reticleBox();
+    const m = custom.find(m => m.reticle && !used.has(m.name));
+    if (m) drawBox(r, `${m.name} ${Math.round(m.score * 100)}%`, "#ff9800", false);
+    else drawBox(r, "", "rgba(255,255,255,.8)", true);
+  }
+}
+
+/* ---------------- camera + loop ---------------- */
 async function startCamera() {
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = await navigator.mediaDevices.getUserMedia({
@@ -133,37 +305,17 @@ async function startCamera() {
   canvas.height = video.videoHeight;
 }
 
-function draw(result) {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.lineWidth = Math.max(2, canvas.width / 320);
-  ctx.font = `${Math.max(14, canvas.width / 45)}px system-ui, sans-serif`;
-  ctx.textBaseline = "top";
-  for (const d of result.detections) {
-    const b = d.boundingBox;
-    const c = d.categories[0];
-    const label = `${c.categoryName} ${Math.round(c.score * 100)}%`;
-    ctx.strokeStyle = "#00e676";
-    ctx.strokeRect(b.originX, b.originY, b.width, b.height);
-    const w = ctx.measureText(label).width + 8;
-    const h = parseInt(ctx.font, 10) + 6;
-    const y = Math.max(0, b.originY - h);
-    ctx.fillStyle = "#00e676";
-    ctx.fillRect(b.originX, y, w, h);
-    ctx.fillStyle = "#000";
-    ctx.fillText(label, b.originX + 4, y + 3);
-  }
-}
-
 function loop() {
   if (!running) return;
   if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
     const result = detector.detectForVideo(video, performance.now());
+    try { recognize(result.detections); } catch (e) { console.warn("recognize failed", e); }
     draw(result);
     frames++;
     const now = performance.now();
     if (now - fpsStart >= 1000) {
-      fps = frames * 1000 / (now - fpsStart);
+      const fps = frames * 1000 / (now - fpsStart);
       frames = 0; fpsStart = now;
       statusEl.textContent = `${fps.toFixed(0)} FPS · ${result.detections.length} object(s)`;
     }
@@ -171,6 +323,61 @@ function loop() {
   requestAnimationFrame(loop);
 }
 
+/* ---------------- teach UI ---------------- */
+function renderList() {
+  objectsEl.textContent = "";
+  const counts = {};
+  for (const s of samples) counts[s.name] = (counts[s.name] || 0) + 1;
+  for (const name in counts) {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.append(`${name} (${counts[name]})`);
+    const del = document.createElement("button");
+    del.textContent = "✕";
+    del.onclick = () => { samples = samples.filter(s => s.name !== name); custom = []; saveSamples(); renderList(); };
+    chip.append(del);
+    objectsEl.append(chip);
+  }
+}
+
+teachBtn.addEventListener("click", () => {
+  panelOpen = !panelOpen;
+  teachPanel.style.display = panelOpen ? "flex" : "none";
+  teachBtn.textContent = panelOpen ? "Done" : "Teach";
+  if (panelOpen) { teachMsg(running ? "" : "Tap Start first so the camera is on."); renderList(); }
+});
+
+captureBtn.addEventListener("click", async () => {
+  const name = nameInput.value.trim();
+  if (!name) { teachMsg("Type a name first."); return; }
+  if (!running) { teachMsg("Tap Start first so the camera is on."); return; }
+  captureBtn.disabled = true;
+  teachMsg("Loading learning model…");
+  if (!(await ensureEmbedder(true))) { captureBtn.disabled = false; return; }
+  for (let i = 0; i < 5; i++) {
+    teachMsg(`Capturing ${i + 1}/5 — move the object slightly`);
+    const v = embedRegion(reticleBox());
+    if (v) samples.push({ name, emb: v });
+    await sleep(350);
+  }
+  saveSamples(); renderList();
+  teachMsg(`Saved samples for "${name}". Capture again from other angles for better results.`);
+  captureBtn.disabled = false;
+});
+
+clearBtn.addEventListener("click", () => {
+  if (!samples.length || !confirm("Delete all taught objects?")) return;
+  samples = []; custom = []; saveSamples(); renderList(); teachMsg("Cleared.");
+});
+
+conf.addEventListener("input", () => {
+  confVal.textContent = conf.value + "%";
+  if (detector) detector.setOptions({ scoreThreshold: conf.value / 100 });
+});
+sizeSl.addEventListener("input", () => { sizeVal.textContent = sizeSl.value + "%"; });
+thrSl.addEventListener("input", () => { thrVal.textContent = thrSl.value + "%"; });
+
+/* ---------------- start / stop ---------------- */
 startBtn.addEventListener("click", async () => {
   if (running) {
     running = false;
@@ -183,7 +390,6 @@ startBtn.addEventListener("click", async () => {
   }
   startBtn.disabled = true;
   try {
-    statusEl.textContent = "Loading model…";
     if (!detector) detector = await createDetector();
     statusEl.textContent = "Starting camera…";
     await startCamera();
@@ -191,6 +397,8 @@ startBtn.addEventListener("click", async () => {
     startBtn.textContent = "Stop";
     flipBtn.disabled = false;
     loop();
+    // Load the learning model in the background if objects were already taught.
+    if (samples.length) ensureEmbedder(false);
   } catch (err) {
     console.error(err);
     statusEl.textContent = "Error: " + (err.message || err) +
@@ -204,6 +412,8 @@ flipBtn.addEventListener("click", async () => {
   facing = facing === "environment" ? "user" : "environment";
   try { await startCamera(); } catch (e) { statusEl.textContent = "Error: " + e.message; }
 });
+
+renderList();
 </script>
 </body>
 </html>
